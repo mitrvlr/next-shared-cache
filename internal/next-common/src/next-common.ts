@@ -1,11 +1,11 @@
-/* eslint-disable @typescript-eslint/method-signature-style -- to use a method style */
-// eslint-disable-next-line unicorn/prefer-node-protocol -- to overcome tsup's limitations
 import type { OutgoingHttpHeaders } from 'http';
 
 import type { RouteMetadata as NextRouteMetadata } from 'next/dist/export/routes/types';
 import type { CacheHandler } from 'next/dist/server/lib/incremental-cache';
 import type IncrementalCache from 'next/dist/server/lib/incremental-cache/file-system-cache';
 
+export type { PrerenderManifest } from 'next/dist/build';
+export type { Revalidate } from 'next/dist/server/lib/revalidate';
 export type { CacheHandler, CacheHandlerContext, CacheHandlerValue } from 'next/dist/server/lib/incremental-cache';
 export type {
     CachedRedirectValue,

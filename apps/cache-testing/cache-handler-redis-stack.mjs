@@ -1,7 +1,7 @@
 import { IncrementalCache } from '@neshca/cache-handler';
-import createLruCache from '@neshca/cache-handler/local-lru';
+// import createLruCache from '@neshca/cache-handler/local-lru';
 import createRedisCache from '@neshca/cache-handler/redis-stack';
-import createRedisStringsCache from '@neshca/cache-handler/redis-strings';
+// import createRedisStringsCache from '@neshca/cache-handler/redis-strings';
 import { createClient } from 'redis';
 
 IncrementalCache.onCreation(async () => {
@@ -24,14 +24,15 @@ IncrementalCache.onCreation(async () => {
         client,
         keyPrefix: 'JSON:',
         timeoutMs: 1000,
+        useTtl: (maxAge) => maxAge * 1.5,
     });
 
-    const redisStringsCache = createRedisStringsCache({ client, keyPrefix: 'strings:', timeoutMs: 1000 });
+    // const redisStringsCache = createRedisStringsCache({ client, keyPrefix: 'strings:', timeoutMs: 1000 });
 
-    const localCache = createLruCache();
+    // const localCache = createLruCache();
 
     return {
-        cache: [redisCache, redisStringsCache, localCache],
+        cache: [redisCache],
         useFileSystem: true,
     };
 });

@@ -12,10 +12,13 @@ import type {
     IncrementalCacheKindHint,
     IncrementalCacheValue,
     NonNullableRouteMetadata,
+    PrerenderManifest,
+    Revalidate,
     RouteMetadata,
     TagsManifest,
 } from '@neshca/next-common';
 
+import { calculateEvictionDelay } from './helpers/calculate-eviction-delay';
 import { isTagsManifest } from './helpers/is-tags-manifest';
 
 const RSC_PREFETCH_SUFFIX = '.prefetch.rsc';
@@ -26,6 +29,31 @@ const NEXT_META_SUFFIX = '.meta';
 export type { CacheHandlerValue };
 
 export type RevalidatedTags = Record<string, number>;
+
+type FallbackStrategy = 'false' | 'true' | 'blocking' | 'unknown';
+
+function determineFallback(routeFallback?: PrerenderManifest['dynamicRoutes'][string]['fallback']): FallbackStrategy {
+    switch (typeof routeFallback) {
+        // false is fallback: false
+        case 'boolean': {
+            return 'false';
+        }
+        // string is fallback: true
+        case 'string': {
+            return 'true';
+        }
+        // null is fallback: blocking
+        case 'object': {
+            return 'blocking';
+        }
+        // anything else is fallback: unknown
+        case 'undefined': {
+            return 'unknown';
+        }
+        default:
+            return 'unknown';
+    }
+}
 
 /**
  * Represents a custom cache implementation. This interface defines essential methods for cache operations.
@@ -256,7 +284,21 @@ export class IncrementalCache implements CacheHandler {
 
     static #debug = typeof process.env.NEXT_PRIVATE_DEBUG_CACHE !== 'undefined';
 
-    static onCreationHook: OnCreationHook;
+    static #routeInitialRevalidateSeconds: Map<string, Revalidate> = new Map();
+
+    static #routeRuntimeRevalidateSeconds: Map<string, Revalidate> = new Map();
+
+    static #routeFallbackStrategy: Map<string, FallbackStrategy> = new Map();
+
+    static #onCreationHook: OnCreationHook;
+
+    static #getRouteRevalidateSeconds(route: string): Revalidate {
+        return (
+            IncrementalCache.#routeRuntimeRevalidateSeconds.get(route) ??
+            IncrementalCache.#routeInitialRevalidateSeconds.get(route) ??
+            1
+        );
+    }
 
     /**
      * Registers a hook to be called during the creation of an IncrementalCache instance.
@@ -272,12 +314,12 @@ export class IncrementalCache implements CacheHandler {
      * @param onCreationHook - The {@link OnCreationHook} function to be called during cache creation.
      */
     public static onCreation(onCreationHook: OnCreationHook): void {
-        IncrementalCache.onCreationHook = onCreationHook;
+        IncrementalCache.#onCreationHook = onCreationHook;
     }
 
-    static async configureIncrementalCache(cacheCreationContext: CacheCreationContext): Promise<void> {
+    static async #configureIncrementalCache(cacheCreationContext: CacheCreationContext): Promise<void> {
         // Retrieve cache configuration by invoking the onCreation hook with the provided context
-        const config = IncrementalCache.onCreationHook(cacheCreationContext);
+        const config = IncrementalCache.#onCreationHook(cacheCreationContext);
 
         // Destructure the cache and useFileSystem settings from the configuration
         // Await the configuration if it's a promise
@@ -324,6 +366,22 @@ export class IncrementalCache implements CacheHandler {
         } catch (_error) {
             // If the file doesn't exist, use the default tagsManifest
         }
+
+        try {
+            const prerenderManifestData = await fsPromises.readFile(
+                path.join(serverDistDir, '..', 'prerender-manifest.json'),
+                'utf-8',
+            );
+            const prerenderManifest = JSON.parse(prerenderManifestData) as PrerenderManifest;
+
+            for (const [route, { initialRevalidateSeconds, srcRoute }] of Object.entries(prerenderManifest.routes)) {
+                IncrementalCache.#routeInitialRevalidateSeconds.set(route, initialRevalidateSeconds);
+                IncrementalCache.#routeFallbackStrategy.set(
+                    route,
+                    determineFallback(prerenderManifest.dynamicRoutes[srcRoute || '']?.fallback),
+                );
+            }
+        } catch (_error) {}
 
         const cacheList: NamedCache[] = Array.isArray(cache)
             ? cache.reduce<NamedCache[]>((items, cacheItem, index) => {
@@ -396,7 +454,6 @@ export class IncrementalCache implements CacheHandler {
                         return revalidatedTags;
                     } catch (error) {
                         if (IncrementalCache.#debug) {
-                            // eslint-disable-next-line no-console -- we want to log this
                             console.warn(`Cache handler "${cacheItem.name}" failed to get revalidated tags.`, error);
                         }
                     }
@@ -409,7 +466,6 @@ export class IncrementalCache implements CacheHandler {
                             return cacheItem.revalidateTag?.(tag, revalidatedAt);
                         } catch (error) {
                             if (IncrementalCache.#debug) {
-                                // eslint-disable-next-line no-console -- we want to log this
                                 console.warn(
                                     `Cache handler "${cacheItem.name}" failed to revalidate tag "${tag}".`,
                                     error,
@@ -430,7 +486,7 @@ export class IncrementalCache implements CacheHandler {
     readonly #serverDistDir: FileSystemCacheContext['serverDistDir'];
     readonly #experimental: FileSystemCacheContext['experimental'];
 
-    public constructor(context: FileSystemCacheContext) {
+    private constructor(context: FileSystemCacheContext) {
         this.#revalidatedTagsArray = context.revalidatedTags ?? [];
         this.#appDir = Boolean(context._appDir);
         this.#pagesDir = context._pagesDir;
@@ -446,7 +502,7 @@ export class IncrementalCache implements CacheHandler {
                 buildId = undefined;
             }
 
-            IncrementalCache.configureIncrementalCache({
+            IncrementalCache.#configureIncrementalCache({
                 dev: context.dev,
                 serverDistDir: this.#serverDistDir,
                 buildId,
@@ -456,10 +512,11 @@ export class IncrementalCache implements CacheHandler {
         }
     }
 
-    async readCacheFromFileSystem(
+    async #readCacheFromFileSystem(
         cacheKey: string,
         kindHint?: IncrementalCacheKindHint,
         tags?: string[],
+        maxAgeSeconds?: number,
     ): Promise<CacheHandlerValue | null> {
         let cachedData: CacheHandlerValue | null = null;
 
@@ -469,11 +526,13 @@ export class IncrementalCache implements CacheHandler {
             const bodyFileData = await fsPromises.readFile(bodyFilePath);
             const { mtime } = await fsPromises.stat(bodyFilePath);
 
+            const lastModified = mtime.getTime();
+
             const metaFileData = await fsPromises.readFile(bodyFilePath.replace(/\.body$/, NEXT_META_SUFFIX), 'utf-8');
             const meta: NonNullableRouteMetadata = JSON.parse(metaFileData) as NonNullableRouteMetadata;
 
             const cacheEntry: CacheHandlerValue = {
-                lastModified: mtime.getTime(),
+                lastModified,
                 value: {
                     kind: 'ROUTE',
                     body: bodyFileData,
@@ -501,8 +560,21 @@ export class IncrementalCache implements CacheHandler {
             const pageFile = await fsPromises.readFile(pageFilePath, 'utf-8');
             const { mtime } = await fsPromises.stat(pageFilePath);
 
+            const lastModified = mtime.getTime();
+
+            const ageSeconds = lastModified ? Math.floor((Date.now() - lastModified) / 1000) : -1;
+
+            const evictionAge = calculateEvictionDelay(maxAgeSeconds, (maxAge) => maxAge * 1.5);
+
+            const fallback = IncrementalCache.#routeFallbackStrategy.get(cacheKey);
+
+            const shouldServe = fallback === 'false';
+
+            if (!shouldServe && typeof evictionAge === 'number' && evictionAge <= ageSeconds) {
+                return null;
+            }
+
             if (kind === 'fetch') {
-                const lastModified = mtime.getTime();
                 const parsedData = JSON.parse(pageFile) as CachedFetchValue;
 
                 cachedData = {
@@ -550,7 +622,7 @@ export class IncrementalCache implements CacheHandler {
                 }
 
                 cachedData = {
-                    lastModified: mtime.getTime(),
+                    lastModified,
                     value: {
                         kind: 'PAGE',
                         html: pageFile,
@@ -624,14 +696,16 @@ export class IncrementalCache implements CacheHandler {
     public async get(...args: CacheHandlerParametersGet): Promise<CacheHandlerValue | null> {
         const [cacheKey, ctx = {}] = args;
 
-        const { tags = [], softTags = [], kindHint } = ctx;
+        const { tags = [], softTags = [], kindHint, revalidate } = ctx;
 
         await IncrementalCache.#creationPromise;
 
         let cachedData: CacheHandlerValue | null = (await IncrementalCache.#cache.get(cacheKey)) ?? null;
 
         if (!cachedData && IncrementalCache.#useFileSystem) {
-            cachedData = await this.readCacheFromFileSystem(cacheKey, kindHint, tags);
+            const maxAgeSeconds = revalidate ?? IncrementalCache.#getRouteRevalidateSeconds(cacheKey);
+
+            cachedData = await this.#readCacheFromFileSystem(cacheKey, kindHint, tags, maxAgeSeconds || undefined);
 
             if (IncrementalCache.#debug) {
                 console.info('get from file system', cacheKey, tags, kindHint, Boolean(cachedData));
@@ -655,7 +729,7 @@ export class IncrementalCache implements CacheHandler {
         return cachedData;
     }
 
-    async writeCacheToFileSystem(data: IncrementalCacheValue, cacheKey: string, tags: string[] = []): Promise<void> {
+    async #writeCacheToFileSystem(data: IncrementalCacheValue, cacheKey: string, tags: string[] = []): Promise<void> {
         // credits to Next.js for the following code
         if (data.kind === 'ROUTE') {
             const filePath = this.#getFilePath(`${cacheKey}.body`, 'app');
@@ -720,21 +794,25 @@ export class IncrementalCache implements CacheHandler {
 
         await IncrementalCache.#creationPromise;
 
+        const maxAgeSeconds = revalidate || undefined;
+
         await IncrementalCache.#cache.set(
             cacheKey,
             {
                 value: data,
                 lastModified: Date.now(),
             },
-            revalidate || undefined,
+            maxAgeSeconds,
         );
+
+        typeof revalidate !== 'undefined' && IncrementalCache.#routeRuntimeRevalidateSeconds.set(cacheKey, revalidate);
 
         if (IncrementalCache.#debug) {
             console.info('set to external cache store', cacheKey);
         }
 
         if (data && IncrementalCache.#useFileSystem) {
-            await this.writeCacheToFileSystem(data, cacheKey, tags);
+            await this.#writeCacheToFileSystem(data, cacheKey, tags);
 
             if (IncrementalCache.#debug) {
                 console.info('set to file system', cacheKey);
@@ -783,7 +861,6 @@ export class IncrementalCache implements CacheHandler {
                 console.info('updated tags manifest file');
             }
         } catch (error) {
-            // eslint-disable-next-line no-console -- we want to log this
             console.warn('failed to update tags manifest.', error);
         }
     }
