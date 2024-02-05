@@ -3,7 +3,6 @@ import { createCache } from '@neshca/next-lru-cache/next-cache-handler-value';
 
 import type { Cache, CacheHandlerValue } from '../cache-handler';
 import type { UseTtlOptions } from '../common-types';
-import { calculateEvictionDelay } from '../helpers/calculate-eviction-delay';
 
 export type LruCacheHandlerOptions = LruCacheOptions & UseTtlOptions;
 
@@ -31,41 +30,32 @@ export type LruCacheHandlerOptions = LruCacheOptions & UseTtlOptions;
  * @remarks
  * - Use this Handler as a fallback for any remote store Handler instead of the filesystem when you use only the App router.
  */
-export default function createLruCache({ useTtl = false, ...lruOptions }: LruCacheHandlerOptions = {}): Cache {
+export default function createLruCache({ ...lruOptions }: LruCacheHandlerOptions = {}): Cache {
     const lruCache = createCache(lruOptions);
 
     return {
         name: 'local-lru',
-        get(key) {
+        get(key, expireAge) {
             const cacheValue = lruCache.get(key);
 
             if (!cacheValue) {
                 return Promise.resolve(null);
             }
 
-            const { lastModified, maxAgeSeconds } = cacheValue;
+            const { lastModified } = cacheValue;
 
-            if (!useTtl || !maxAgeSeconds) {
-                return Promise.resolve(cacheValue as CacheHandlerValue);
+            const ageSeconds = Math.floor((Date.now() - lastModified) / 1000);
+
+            if (ageSeconds > expireAge) {
+                lruCache.delete(key);
+
+                return Promise.resolve(null);
             }
 
-            const ageSeconds = lastModified ? Math.floor((Date.now() - lastModified) / 1000) : 0;
-
-            const evictionAge = calculateEvictionDelay(maxAgeSeconds, useTtl);
-
-            if (!evictionAge || evictionAge > ageSeconds) {
-                return Promise.resolve(cacheValue as CacheHandlerValue);
-            }
-
-            lruCache.delete(key);
-
-            return Promise.resolve(null);
+            return Promise.resolve(cacheValue as CacheHandlerValue);
         },
-        set(key, value, maxAgeSeconds) {
-            lruCache.set(key, {
-                ...value,
-                maxAgeSeconds,
-            });
+        set(key, value) {
+            lruCache.set(key, value);
 
             return Promise.resolve();
         },

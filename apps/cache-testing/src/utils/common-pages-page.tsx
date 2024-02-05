@@ -10,7 +10,7 @@ export function CommonPagesPage({ count, revalidateAfter, time, path }: PageProp
     return (
         <div>
             <div data-pw="data" id={path}>
-                {isFallback && count}
+                {count}
             </div>
             <PreRenderedAt isFallback={isFallback} time={time} />
             <CacheStateWatcher revalidateAfter={revalidateAfter} time={time} />

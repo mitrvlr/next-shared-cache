@@ -24,7 +24,6 @@ IncrementalCache.onCreation(async () => {
         client,
         keyPrefix: 'JSON:',
         timeoutMs: 1000,
-        useTtl: (maxAge) => maxAge * 1.5,
     });
 
     // const redisStringsCache = createRedisStringsCache({ client, keyPrefix: 'strings:', timeoutMs: 1000 });
@@ -34,6 +33,7 @@ IncrementalCache.onCreation(async () => {
     return {
         cache: [redisCache],
         useFileSystem: true,
+        calculateExpireAge: (maxAge) => maxAge * 1.5,
     };
 });
 

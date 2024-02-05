@@ -1,12 +1,12 @@
 import type { OutgoingHttpHeaders } from 'http';
 
 import type { RouteMetadata as NextRouteMetadata } from 'next/dist/export/routes/types';
-import type { CacheHandler } from 'next/dist/server/lib/incremental-cache';
+import type { CacheHandler, CacheHandlerValue as NextCacheHandlerValue } from 'next/dist/server/lib/incremental-cache';
 import type IncrementalCache from 'next/dist/server/lib/incremental-cache/file-system-cache';
 
 export type { PrerenderManifest } from 'next/dist/build';
 export type { Revalidate } from 'next/dist/server/lib/revalidate';
-export type { CacheHandler, CacheHandlerContext, CacheHandlerValue } from 'next/dist/server/lib/incremental-cache';
+export type { CacheHandler, CacheHandlerContext } from 'next/dist/server/lib/incremental-cache';
 export type {
     CachedRedirectValue,
     CachedRouteValue,
@@ -16,6 +16,10 @@ export type {
     IncrementalCacheEntry,
     IncrementalCacheKindHint,
 } from 'next/dist/server/response-cache/types';
+
+export type CacheHandlerValue = NextCacheHandlerValue & {
+    lastModified: number;
+};
 
 export type RouteMetadata = NextRouteMetadata;
 

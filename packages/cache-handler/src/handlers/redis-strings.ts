@@ -2,7 +2,6 @@ import { replaceJsonWithBase64, reviveFromBase64Representation } from '@neshca/j
 import type { RedisClientType } from 'redis';
 
 import type { Cache, CacheHandlerValue, RevalidatedTags } from '../cache-handler';
-import { calculateEvictionDelay } from '../helpers/calculate-eviction-delay';
 import { getTimeoutRedisCommandOptions } from '../helpers/get-timeout-redis-command-options';
 
 import type { RedisCacheHandlerOptions } from './redis-stack';
@@ -39,7 +38,6 @@ export default function createCache<T extends RedisClientType>({
     client,
     keyPrefix = '',
     revalidatedTagsKey = '__sharedRevalidatedTags__',
-    useTtl = false,
     timeoutMs = 5000,
 }: RedisCacheHandlerOptions<T>): Cache {
     function assertClientIsReady(): void {
@@ -64,18 +62,21 @@ export default function createCache<T extends RedisClientType>({
             // use reviveFromBase64Representation to restore binary data from Base64
             return JSON.parse(result, reviveFromBase64Representation) as CacheHandlerValue | null;
         },
-        async set(key, value, maxAgeSeconds) {
+        async set(key, value, cacheOptions) {
             assertClientIsReady();
 
-            const evictionDelay = calculateEvictionDelay(maxAgeSeconds, useTtl);
+            const options = getTimeoutRedisCommandOptions(timeoutMs);
 
             // use replaceJsonWithBase64 to store binary data in Base64 and save space
-            await client.set(
-                getTimeoutRedisCommandOptions(timeoutMs),
-                keyPrefix + key,
-                JSON.stringify(value, replaceJsonWithBase64),
-                evictionDelay ? { EX: evictionDelay } : undefined,
-            );
+            const setOperation = client.set(options, keyPrefix + key, JSON.stringify(value, replaceJsonWithBase64));
+
+            const operations: Promise<unknown>[] = [setOperation];
+
+            if (cacheOptions.expireAt) {
+                operations.push(client.expireAt(options, keyPrefix + key, cacheOptions.expireAt));
+            }
+
+            await Promise.allSettled(operations);
         },
         async getRevalidatedTags() {
             assertClientIsReady();
