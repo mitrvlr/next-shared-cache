@@ -18,6 +18,9 @@ export type {
 } from 'next/dist/server/response-cache/types';
 
 export type CacheHandlerValue = NextCacheHandlerValue & {
+    /**
+     * Timestamp in milliseconds when the cache entry was last modified.
+     */
     lastModified: number;
 };
 

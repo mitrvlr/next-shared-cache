@@ -31,23 +31,23 @@ export type LruCacheHandlerOptions = LruCacheOptions & UseTtlOptions;
  * - Use this Handler as a fallback for any remote store Handler instead of the filesystem when you use only the App router.
  */
 export default function createLruCache({ ...lruOptions }: LruCacheHandlerOptions = {}): Cache {
-    const lruCache = createCache(lruOptions);
+    const lruCacheStore = createCache(lruOptions);
 
     return {
         name: 'local-lru',
         get(key, expireAge) {
-            const cacheValue = lruCache.get(key);
+            const cacheValue = lruCacheStore.get(key);
 
             if (!cacheValue) {
                 return Promise.resolve(null);
             }
 
-            const { lastModified } = cacheValue;
+            const lastModifiedMs = cacheValue.lastModified;
 
-            const ageSeconds = Math.floor((Date.now() - lastModified) / 1000);
+            const ageSeconds = Math.floor((Date.now() - lastModifiedMs) / 1000);
 
             if (ageSeconds > expireAge) {
-                lruCache.delete(key);
+                lruCacheStore.delete(key);
 
                 return Promise.resolve(null);
             }
@@ -55,7 +55,7 @@ export default function createLruCache({ ...lruOptions }: LruCacheHandlerOptions
             return Promise.resolve(cacheValue as CacheHandlerValue);
         },
         set(key, value) {
-            lruCache.set(key, value);
+            lruCacheStore.set(key, value);
 
             return Promise.resolve();
         },

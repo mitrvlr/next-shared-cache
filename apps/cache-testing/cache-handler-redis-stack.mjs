@@ -32,8 +32,7 @@ IncrementalCache.onCreation(async () => {
 
     return {
         cache: [redisCache],
-        useFileSystem: true,
-        calculateExpireAge: (maxAge) => maxAge * 1.5,
+        determineExpireAge: (staleAge) => staleAge * 1.5,
     };
 });
 

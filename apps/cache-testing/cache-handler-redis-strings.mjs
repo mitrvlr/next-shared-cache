@@ -30,7 +30,6 @@ IncrementalCache.onCreation(async () => {
 
     return {
         cache: [redisCache, localCache],
-        useFileSystem: true,
     };
 });
 

@@ -13,7 +13,6 @@ IncrementalCache.onCreation(async () => {
 
     return {
         cache: [httpCache, localCache],
-        useFileSystem: true,
     };
 });
 

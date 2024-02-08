@@ -18,6 +18,7 @@ import type {
     TagsManifest,
 } from '@neshca/next-common';
 
+import { MAX_INT32 } from './constants';
 import { isTagsManifest } from './helpers/is-tags-manifest';
 
 const RSC_PREFETCH_SUFFIX = '.prefetch.rsc';
@@ -30,6 +31,10 @@ export type { CacheHandlerValue };
 export type RevalidatedTags = Record<string, number>;
 
 type FallbackStrategy = 'false' | 'true' | 'blocking' | 'unknown';
+
+function defaultDetermineExpireAge(staleAge: number): number {
+    return staleAge;
+}
 
 function determineFallback(routeFallback?: PrerenderManifest['dynamicRoutes'][string]['fallback']): FallbackStrategy {
     switch (typeof routeFallback) {
@@ -56,7 +61,10 @@ function determineFallback(routeFallback?: PrerenderManifest['dynamicRoutes'][st
 
 const ONE_YEAR_IN_SECONDS = 60 * 60 * 24 * 365;
 
-type CacheControlParameters = {
+/**
+ * A set of time periods and timestamps for controlling cache behavior.
+ */
+type LifespanParameters = {
     /**
      * The Unix timestamp (in seconds) for when the cache entry was last modified.
      */
@@ -94,7 +102,57 @@ export type Cache = {
      *
      * @param key - The unique string identifier for the cache entry.
      *
+     * @param expireAge - The expiration age of the cache entry in seconds.
+     *
      * @returns A Promise that resolves to the cached value (if found), `null` or `undefined` if the entry is not found.
+     *
+     * @example
+     * ### With auto expiration
+     *
+     * If your cache store supports expiration, the `get` method is straightforward.
+     *
+     * ```js
+     *  const handler = {
+     *    async get(key) {
+     *      const cacheValue = await cacheStore.get(key);
+     *
+     *      if (!cacheValue) {
+     *          return null;
+     *      }
+     *
+     *      return cacheValue;
+     *   }
+     * }
+     * ```
+     *
+     * ### Without auto expiration
+     *
+     * If your cache store does not support expiration, you can use the `expireAge` parameter to determine the expiration of the cache entry.
+     *
+     * ```js
+     *  const handler = {
+     *    async get(key, expireAge) {
+     *      const cacheValue = await cacheStore.get(key);
+     *
+     *      if (!cacheValue) {
+     *          return null;
+     *      }
+     *
+     *      const lastModifiedMs = cacheValue.lastModified;
+     *
+     *      const ageSeconds = Math.floor((Date.now() - lastModifiedMs) / 1000);
+     *
+     *      if (ageSeconds > expireAge) {
+     *          // you may delete it from the cache store to free up space
+     *          cacheStore.delete(key);
+     *
+     *          return null;
+     *      }
+     *
+     *      return cacheValue;
+     *   }
+     * }
+     * ```
      */
     get: (key: string, expireAge: number) => Promise<CacheHandlerValue | null | undefined>;
     /**
@@ -102,17 +160,21 @@ export type Cache = {
      *
      * @param key - The unique string identifier for the cache entry.
      *
-     * @param value - The value to be stored in the cache.
+     * @param value - The value to be stored in the cache. See {@link CacheHandlerValue}.
      *
-     * @param maxAgeSeconds - Optional. Delay in seconds before the cache entry becomes stale.
-     * If undefined, the cache entry will not become stale.
+     * @param lifespanParameters - An object containing cache control parameters for the cache entry. See {@link LifespanParameters}.
      *
-     * @returns A Promise with no value.
+     * @returns A Promise that resolves when the value has been successfully set in the cache.
      *
      * @remarks
-     * Use `maxAgeSeconds` only if you don't use Pages directory.
+     * ### LifespanParameters
+     * If no `revalidate` option or `revalidate: false` is set in your [getStaticProps](https://nextjs.org/docs/pages/api-reference/functions/get-static-props#revalidate)
+     * or [App Router `revalidate` option](https://nextjs.org/docs/app/building-your-application/data-fetching/fetching-caching-and-revalidating#time-based-revalidation),
+     * the `staleAge` time period for the cache entry will be set to 1 year by default.
+     *
+     * Use the absolute time (`expireAt`) to set and expiration time for the cache entry in your cache store to be in sync with the file system cache.
      */
-    set: (key: string, value: CacheHandlerValue, cacheControlParameters: CacheControlParameters) => Promise<void>;
+    set: (key: string, value: CacheHandlerValue, lifespanParameters: LifespanParameters) => Promise<void>;
     /**
      * Retrieves the {@link RevalidatedTags} object.
      *
@@ -139,19 +201,22 @@ type NamedCache = Cache & {
 };
 
 /**
- * Configuration options for cache behavior.
+ * Configuration options for the cache handler.
  */
 export type CacheConfig = {
-    /**
-     * Determines whether to use the file system caching in addition to the provided cache.
-     */
-    useFileSystem?: boolean;
     /**
      * A custom cache instance or an array of cache instances that conform to the Cache interface.
      * Multiple caches can be used to implement various caching strategies or layers.
      */
     cache: Cache | (Cache | undefined | null)[];
-    calculateExpireAge?: (staleAge: number) => number;
+    /**
+     * A function that calculates the expiration age of stale cache entries.
+     *
+     * @param staleAge - The age of the stale cache entry.
+     *
+     * @returns The expiration age of the cache entry.
+     */
+    determineExpireAge?(staleAge: number): number;
 };
 
 /**
@@ -200,7 +265,6 @@ export type CacheCreationContext = {
      *
      *   return {
      *     cache: [redisCache, localCache],
-     *     useFileSystem: true,
      *   };
      * });
      * ```
@@ -258,7 +322,6 @@ export class IncrementalCache implements CacheHandler {
      *
      *   return {
      *     cache: [redisCache, localCache],
-     *     useFileSystem: true,
      *   };
      * });
      *
@@ -274,7 +337,7 @@ export class IncrementalCache implements CacheHandler {
 
         return `@neshca/cache-handler with ${IncrementalCache.#cacheListLength} Handler${
             IncrementalCache.#cacheListLength > 1 ? 's' : ''
-        } and ${IncrementalCache.#useFileSystem ? 'file system' : 'no file system'} caching`;
+        }`;
     }
 
     static #resolveCreationPromise: () => void;
@@ -296,11 +359,6 @@ export class IncrementalCache implements CacheHandler {
      */
     static #hasPagesDir = false;
 
-    /**
-     * Determines whether to use the file system caching in addition to the provided cache.
-     */
-    static #useFileSystem = true;
-
     static #cache: Cache;
 
     static #cacheListLength: number;
@@ -317,23 +375,43 @@ export class IncrementalCache implements CacheHandler {
 
     static #routeFallbackStrategy: Map<string, FallbackStrategy> = new Map();
 
-    static #calculateExpireAge: CacheConfig['calculateExpireAge'];
+    static #determineExpireAge: NonNullable<CacheConfig['determineExpireAge']>;
 
     static #onCreationHook: OnCreationHook;
 
     static #getRouteRevalidateSeconds(route: string): Revalidate {
         return (
+            // Users may change the revalidate option at runtime. We should use the runtime value if it exists.
             IncrementalCache.#routeRuntimeRevalidateSeconds.get(route) ??
+            // If the runtime value doesn't exist, we should use the initial value.
             IncrementalCache.#routeInitialRevalidateSeconds.get(route) ??
+            // If the initial value doesn't exist, we should force the revalidation by setting the revalidate to 1 second.
             1
         );
     }
 
-    static #getCacheControlParameters(lastModified: number, revalidate?: Revalidate): CacheControlParameters {
+    /**
+     * Returns the cache control parameters based on the last modified timestamp and revalidate option.
+     *
+     * @param lastModified The last modified timestamp in milliseconds.
+     *
+     * @param revalidate The revalidate option, representing the maximum age of stale data in seconds.
+     *
+     * @returns The cache control parameters including expire age, expire at, last modified at, stale age, and stale at.
+     *
+     * @remarks
+     * - `lastModifiedAt` is the Unix timestamp (in seconds) for when the cache entry was last modified.
+     * - `staleAge` is the time period in seconds which equals to the `revalidate` option from Next.js pages.
+     * If page has no `revalidate` option, it will be set to 1 year.
+     * - `expireAge` is the time period in seconds for when the cache entry becomes expired.
+     * - `staleAt` is the Unix timestamp (in seconds) for when the cache entry becomes stale.
+     * - `expireAt` is the Unix timestamp (in seconds) for when the cache entry must be removed from the cache.
+     */
+    static #lheLifespanParameters(lastModified: number, revalidate?: Revalidate): LifespanParameters {
         const lastModifiedAt = Math.floor(lastModified / 1000);
         const staleAge = revalidate || ONE_YEAR_IN_SECONDS;
         const staleAt = lastModifiedAt + staleAge;
-        const expireAge = IncrementalCache.#calculateExpireAge?.(staleAge) ?? staleAge;
+        const expireAge = IncrementalCache.#determineExpireAge?.(staleAge) ?? staleAge;
         const expireAt = Math.floor(lastModifiedAt + expireAge);
 
         return { expireAge, expireAt, lastModifiedAt, staleAge, staleAt };
@@ -360,22 +438,30 @@ export class IncrementalCache implements CacheHandler {
         // Retrieve cache configuration by invoking the onCreation hook with the provided context
         const config = IncrementalCache.#onCreationHook(cacheCreationContext);
 
-        // Destructure the cache and useFileSystem settings from the configuration
-        // Await the configuration if it's a promise
-        const { cache, calculateExpireAge, useFileSystem = true } = config instanceof Promise ? await config : config;
+        // Wait for the cache configuration to be resolved
+        const { cache, determineExpireAge = defaultDetermineExpireAge } = await config;
 
         // Extract the server distribution directory from the cache creation context
-        const { serverDistDir } = cacheCreationContext;
+        const { serverDistDir, dev } = cacheCreationContext;
+
+        // Notify the user that the cache is not used in development mode
+        if (dev) {
+            console.warn('Next.js does not use the cache in development mode. Use production mode to enable caching.');
+        }
 
         // Check if the pages directory exists and set the flag accordingly
         IncrementalCache.#hasPagesDir = fs.existsSync(path.join(serverDistDir, 'pages'));
 
-        // Set the class-level flag to determine if the file system caching should be used
-        IncrementalCache.#useFileSystem = useFileSystem;
+        // Set the class-level function to calculate the expiration age of stale cache entries
+        IncrementalCache.#determineExpireAge = (staleAge) => {
+            const expireAge = Math.floor(determineExpireAge(staleAge));
 
-        if (typeof calculateExpireAge === 'function') {
-            IncrementalCache.#calculateExpireAge = calculateExpireAge;
-        }
+            if (!Number.isInteger(expireAge) || expireAge <= 0 || expireAge > MAX_INT32) {
+                throw new Error(`The expire age must be a positive integer and less than ${MAX_INT32}.`);
+            }
+
+            return expireAge;
+        };
 
         // Define the path for the tags manifest file
         IncrementalCache.#tagsManifestPath = path.join(
@@ -418,7 +504,9 @@ export class IncrementalCache implements CacheHandler {
             const prerenderManifest = JSON.parse(prerenderManifestData) as PrerenderManifest;
 
             for (const [route, { initialRevalidateSeconds, srcRoute }] of Object.entries(prerenderManifest.routes)) {
+                // Set the initial revalidate seconds for the route
                 IncrementalCache.#routeInitialRevalidateSeconds.set(route, initialRevalidateSeconds);
+                // Set the fallback strategy for the route
                 IncrementalCache.#routeFallbackStrategy.set(
                     route,
                     determineFallback(prerenderManifest.dynamicRoutes[srcRoute || '']?.fallback),
@@ -426,39 +514,26 @@ export class IncrementalCache implements CacheHandler {
             }
         } catch (_error) {}
 
-        const cacheList: NamedCache[] = Array.isArray(cache)
-            ? cache.reduce<NamedCache[]>((items, cacheItem, index) => {
-                  if (cacheItem) {
-                      items.push({
-                          ...cacheItem,
-                          name: cacheItem.name || index.toString(),
-                      });
-                  }
+        // Add default names to the cache handlers if they don't have one
+        const cacheHandlersList: NamedCache[] = [];
 
-                  return items;
-              }, [])
-            : [{ name: '0', ...cache }];
-
-        IncrementalCache.#cacheListLength = cacheList.length;
-
-        // if no cache is provided and we don't use the file system
-        if (cacheList.length === 0 && !IncrementalCache.#useFileSystem) {
-            throw new Error(
-                'No cache provided and file system caching is disabled. Please provide a cache or enable file system caching.',
-            );
+        if (Array.isArray(cache)) {
+            for (const [index, cacheItem] of cache.entries()) {
+                if (cacheItem) {
+                    cacheItem.name = cacheItem.name || index.toString(10);
+                    cacheHandlersList.push(cacheItem as NamedCache);
+                }
+            }
+        } else {
+            cache.name = cache.name || '0';
+            cacheHandlersList.push(cache as NamedCache);
         }
 
-        if (
-            !IncrementalCache.#useFileSystem &&
-            typeof calculateExpireAge === 'function' &&
-            IncrementalCache.#hasPagesDir
-        ) {
-            console.info('File system caching will be used for the Pages directory.');
-        }
+        IncrementalCache.#cacheListLength = cacheHandlersList.length;
 
         IncrementalCache.#cache = {
             async get(key, expireAge) {
-                for await (const cacheItem of cacheList) {
+                for await (const cacheItem of cacheHandlersList) {
                     try {
                         const cacheValue = await cacheItem.get(key, expireAge);
 
@@ -479,11 +554,11 @@ export class IncrementalCache implements CacheHandler {
 
                 return null;
             },
-            async set(key, value, cacheControlParameters) {
+            async set(key, value, lifespanParameters) {
                 await Promise.allSettled(
-                    cacheList.map((cacheItem) => {
+                    cacheHandlersList.map((cacheItem) => {
                         try {
-                            return cacheItem.set(key, value, cacheControlParameters);
+                            return cacheItem.set(key, value, lifespanParameters);
                         } catch (error) {
                             if (IncrementalCache.#debug) {
                                 console.warn(
@@ -498,7 +573,7 @@ export class IncrementalCache implements CacheHandler {
                 );
             },
             async getRevalidatedTags() {
-                for await (const cacheItem of cacheList) {
+                for await (const cacheItem of cacheHandlersList) {
                     try {
                         const revalidatedTags = await cacheItem.getRevalidatedTags?.();
 
@@ -512,7 +587,7 @@ export class IncrementalCache implements CacheHandler {
             },
             async revalidateTag(tag, revalidatedAt) {
                 await Promise.allSettled(
-                    cacheList.map((cacheItem) => {
+                    cacheHandlersList.map((cacheItem) => {
                         try {
                             return cacheItem.revalidateTag?.(tag, revalidatedAt);
                         } catch (error) {
@@ -569,37 +644,30 @@ export class IncrementalCache implements CacheHandler {
         tags?: string[],
         expireAge = ONE_YEAR_IN_SECONDS,
     ): Promise<CacheHandlerValue | null> {
-        let cachedData: CacheHandlerValue | null = null;
+        try {
+            const bodyFilePath = this.#getFilePath(`${cacheKey}.body`, 'app');
 
-        if (!IncrementalCache.#useFileSystem) {
-            try {
-                const bodyFilePath = this.#getFilePath(`${cacheKey}.body`, 'app');
+            const bodyFileData = await fsPromises.readFile(bodyFilePath);
+            const { mtime } = await fsPromises.stat(bodyFilePath);
 
-                const bodyFileData = await fsPromises.readFile(bodyFilePath);
-                const { mtime } = await fsPromises.stat(bodyFilePath);
+            const lastModified = mtime.getTime();
 
-                const lastModified = mtime.getTime();
+            const metaFileData = await fsPromises.readFile(bodyFilePath.replace(/\.body$/, NEXT_META_SUFFIX), 'utf-8');
+            const meta: NonNullableRouteMetadata = JSON.parse(metaFileData) as NonNullableRouteMetadata;
 
-                const metaFileData = await fsPromises.readFile(
-                    bodyFilePath.replace(/\.body$/, NEXT_META_SUFFIX),
-                    'utf-8',
-                );
-                const meta: NonNullableRouteMetadata = JSON.parse(metaFileData) as NonNullableRouteMetadata;
+            const cacheEntry: CacheHandlerValue = {
+                lastModified,
+                value: {
+                    kind: 'ROUTE',
+                    body: bodyFileData,
+                    headers: meta.headers,
+                    status: meta.status,
+                },
+            };
 
-                const cacheEntry: CacheHandlerValue = {
-                    lastModified,
-                    value: {
-                        kind: 'ROUTE',
-                        body: bodyFileData,
-                        headers: meta.headers,
-                        status: meta.status,
-                    },
-                };
-
-                return cacheEntry;
-            } catch (_) {
-                // no .meta data for the related key
-            }
+            return cacheEntry;
+        } catch (_) {
+            // no .meta data for the related key
         }
 
         try {
@@ -611,11 +679,6 @@ export class IncrementalCache implements CacheHandler {
             }
 
             const isAppPath = kind === 'app';
-
-            // If we're not using the file system and the path is an App Router path, we don't need to read from the file system.
-            if (!IncrementalCache.#useFileSystem && isAppPath) {
-                return null;
-            }
 
             const pageFilePath = this.#getFilePath(kind === 'fetch' ? cacheKey : `${cacheKey}.html`, kind);
 
@@ -637,7 +700,7 @@ export class IncrementalCache implements CacheHandler {
             if (kind === 'fetch') {
                 const parsedData = JSON.parse(pageFile) as CachedFetchValue;
 
-                cachedData = {
+                const cachedData = {
                     lastModified,
                     value: parsedData,
                 };
@@ -655,49 +718,48 @@ export class IncrementalCache implements CacheHandler {
                         await this.set(cacheKey, cachedData.value, { tags });
                     }
                 }
-            } else {
-                const pageDataFilePath = isAppPath
-                    ? this.#getFilePath(
-                          `${cacheKey}${this.#experimental.ppr ? RSC_PREFETCH_SUFFIX : RSC_SUFFIX}`,
-                          'app',
-                      )
-                    : this.#getFilePath(`${cacheKey}${NEXT_DATA_SUFFIX}`, 'pages');
 
-                const pageDataFile = await fsPromises.readFile(pageDataFilePath, 'utf-8');
-
-                const pageData = isAppPath ? pageDataFile : (JSON.parse(pageDataFile) as object);
-
-                let meta: RouteMetadata | undefined;
-
-                if (isAppPath) {
-                    try {
-                        const metaFileData = await fsPromises.readFile(
-                            pageFilePath.replace(/\.html$/, NEXT_META_SUFFIX),
-                            'utf-8',
-                        );
-                        meta = JSON.parse(metaFileData) as RouteMetadata;
-                    } catch {
-                        // no .meta data for the related key
-                    }
-                }
-
-                cachedData = {
-                    lastModified,
-                    value: {
-                        kind: 'PAGE',
-                        html: pageFile,
-                        pageData,
-                        postponed: meta?.postponed,
-                        headers: meta?.headers,
-                        status: meta?.status,
-                    },
-                };
+                return cachedData;
             }
+
+            const pageDataFilePath = isAppPath
+                ? this.#getFilePath(`${cacheKey}${this.#experimental.ppr ? RSC_PREFETCH_SUFFIX : RSC_SUFFIX}`, 'app')
+                : this.#getFilePath(`${cacheKey}${NEXT_DATA_SUFFIX}`, 'pages');
+
+            const pageDataFile = await fsPromises.readFile(pageDataFilePath, 'utf-8');
+
+            const pageData = isAppPath ? pageDataFile : (JSON.parse(pageDataFile) as object);
+
+            let meta: RouteMetadata | undefined;
+
+            if (isAppPath) {
+                try {
+                    const metaFileData = await fsPromises.readFile(
+                        pageFilePath.replace(/\.html$/, NEXT_META_SUFFIX),
+                        'utf-8',
+                    );
+                    meta = JSON.parse(metaFileData) as RouteMetadata;
+                } catch {
+                    // no .meta data for the related key
+                }
+            }
+
+            return {
+                lastModified,
+                value: {
+                    kind: 'PAGE',
+                    html: pageFile,
+                    pageData,
+                    postponed: meta?.postponed,
+                    headers: meta?.headers,
+                    status: meta?.status,
+                },
+            };
         } catch (_) {
             // unable to get data from the file system
         }
 
-        return cachedData;
+        return null;
     }
 
     async #revalidateCachedData(cachedData: CacheHandlerValue, tags: string[], softTags: string[]): Promise<boolean> {
@@ -760,24 +822,29 @@ export class IncrementalCache implements CacheHandler {
 
         const { tags = [], softTags = [], kindHint, revalidate } = ctx;
 
-        const staleAge = (revalidate ?? IncrementalCache.#getRouteRevalidateSeconds(cacheKey)) || ONE_YEAR_IN_SECONDS;
+        const inferredRevalidate = revalidate ?? IncrementalCache.#getRouteRevalidateSeconds(cacheKey);
 
-        const expireAge = IncrementalCache.#calculateExpireAge?.(staleAge) ?? ONE_YEAR_IN_SECONDS;
+        const staleAge = inferredRevalidate || ONE_YEAR_IN_SECONDS;
 
-        let cachedData: CacheHandlerValue | null | undefined = await IncrementalCache.#cache.get(cacheKey, expireAge);
+        const expireAge = IncrementalCache.#determineExpireAge?.(staleAge) ?? staleAge;
+
+        let cachedData: CacheHandlerValue | null | undefined = await IncrementalCache.#cache.get(
+            cacheKey,
+            Math.floor(expireAge),
+        );
 
         if (!cachedData) {
             cachedData = await this.#readCacheFromFileSystem(cacheKey, kindHint, tags, expireAge);
 
             if (IncrementalCache.#debug) {
-                console.info('get from file system', cacheKey, tags, kindHint, Boolean(cachedData));
+                console.info('get from file system', cacheKey, tags, kindHint, 'got any value', Boolean(cachedData));
             }
 
             if (cachedData) {
                 await IncrementalCache.#cache.set(
                     cacheKey,
                     cachedData,
-                    IncrementalCache.#getCacheControlParameters(cachedData.lastModified, staleAge),
+                    IncrementalCache.#lheLifespanParameters(cachedData.lastModified, staleAge),
                 );
             }
         }
@@ -798,13 +865,7 @@ export class IncrementalCache implements CacheHandler {
     async #writeCacheToFileSystem(cacheKey: string, data: IncrementalCacheValue, tags: string[] = []): Promise<void> {
         switch (data.kind) {
             case 'FETCH': {
-                // Fetch is App Router only so we don't need to write to the file system if it is disabled.
-                if (!IncrementalCache.#useFileSystem) {
-                    return;
-                }
-
                 const filePath = this.#getFilePath(cacheKey, 'fetch');
-
                 await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
                 await fsPromises.writeFile(
                     filePath,
@@ -818,12 +879,6 @@ export class IncrementalCache implements CacheHandler {
             }
             case 'PAGE': {
                 const isAppPath = typeof data.pageData === 'string';
-
-                // Page is App Router only so we don't need to write to the file system if it is disabled.
-                if (!IncrementalCache.#useFileSystem && isAppPath) {
-                    return;
-                }
-
                 const htmlPath = this.#getFilePath(`${cacheKey}.html`, isAppPath ? 'app' : 'pages');
                 await fsPromises.mkdir(path.dirname(htmlPath), { recursive: true });
                 await fsPromises.writeFile(htmlPath, data.html);
@@ -848,13 +903,7 @@ export class IncrementalCache implements CacheHandler {
                 return;
             }
             case 'ROUTE': {
-                // Fetch is App Router only so we don't need to write to the file system if it is disabled.
-                if (!IncrementalCache.#useFileSystem) {
-                    return;
-                }
-
                 const filePath = this.#getFilePath(`${cacheKey}.body`, 'app');
-
                 const meta: RouteMetadata = {
                     headers: data.headers,
                     status: data.status,
@@ -877,11 +926,11 @@ export class IncrementalCache implements CacheHandler {
     }
 
     public async set(...args: CacheHandlerParametersSet): Promise<void> {
+        await IncrementalCache.#creationPromise;
+
         const [cacheKey, data, ctx] = args;
 
         const { revalidate, tags } = ctx;
-
-        await IncrementalCache.#creationPromise;
 
         const lastModified = Date.now();
 
@@ -893,7 +942,7 @@ export class IncrementalCache implements CacheHandler {
                 value: data,
                 lastModified,
             },
-            IncrementalCache.#getCacheControlParameters(Date.now(), staleAge),
+            IncrementalCache.#lheLifespanParameters(Date.now(), staleAge),
         );
 
         typeof revalidate !== 'undefined' && IncrementalCache.#routeRuntimeRevalidateSeconds.set(cacheKey, revalidate);
@@ -912,13 +961,13 @@ export class IncrementalCache implements CacheHandler {
     }
 
     public async revalidateTag(...args: CacheHandlerParametersRevalidateTag): Promise<void> {
+        await IncrementalCache.#creationPromise;
+
         const [tag] = args;
 
         if (IncrementalCache.#debug) {
             console.info('revalidateTag', tag);
         }
-
-        await IncrementalCache.#creationPromise;
 
         await IncrementalCache.#cache.revalidateTag?.(tag, Date.now());
 
