@@ -94,7 +94,7 @@ export default async function createCache<T extends RedisClientType>({
 
             return cacheValue;
         },
-        async set(key, cacheValue, cacheOptions) {
+        async set(key, cacheValue, { expireAt }) {
             assertClientIsReady();
 
             let preparedCacheValue = cacheValue;
@@ -114,13 +114,9 @@ export default async function createCache<T extends RedisClientType>({
                 preparedCacheValue as unknown as RedisJSON,
             );
 
-            const commands: Promise<unknown>[] = [setCacheValue];
+            const expireCacheValue = client.expireAt(options, keyPrefix + key, expireAt);
 
-            if (cacheOptions.expireAt) {
-                commands.push(client.expireAt(options, keyPrefix + key, cacheOptions.expireAt));
-            }
-
-            await Promise.allSettled(commands);
+            await Promise.all([setCacheValue, expireCacheValue]);
         },
         async getRevalidatedTags() {
             assertClientIsReady();

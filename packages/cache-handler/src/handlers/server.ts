@@ -65,12 +65,12 @@ export default function createCache({ baseUrl, timeoutMs }: ServerCacheHandlerOp
 
             return JSON.parse(string, reviveFromBase64Representation) as CacheHandlerValue;
         },
-        async set(key, value, ttl) {
+        async set(key, value, { expireAge }) {
             const url = new URL('/set', baseUrl);
 
             const response = await fetch(url, {
                 method: 'POST',
-                body: JSON.stringify([key, JSON.stringify(value, replaceJsonWithBase64), ttl]),
+                body: JSON.stringify([key, JSON.stringify(value, replaceJsonWithBase64), expireAge]),
                 headers: {
                     'Content-Type': 'application/json',
                 },

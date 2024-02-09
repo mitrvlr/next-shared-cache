@@ -18,7 +18,7 @@ import type {
     TagsManifest,
 } from '@neshca/next-common';
 
-import { MAX_INT32 } from './constants';
+import { createValidatedAgeEstimationFunction } from './helpers/create-validated-age-estimation-function';
 import { isTagsManifest } from './helpers/is-tags-manifest';
 
 const RSC_PREFETCH_SUFFIX = '.prefetch.rsc';
@@ -28,38 +28,44 @@ const NEXT_META_SUFFIX = '.meta';
 
 export type { CacheHandlerValue };
 
+/**
+ * Represents a record of revalidated tags.
+ * The keys are the tags and the values are the Unix timestamps (in milliseconds) of when the tags were revalidated.
+ */
 export type RevalidatedTags = Record<string, number>;
 
+/**
+ * Represents the fallback strategy for cache handling inferred from the Next.js prerender manifest.
+ * The possible values are: 'false', 'true', 'blocking', 'unknown'.
+ */
 type FallbackStrategy = 'false' | 'true' | 'blocking' | 'unknown';
 
-function defaultDetermineExpireAge(staleAge: number): number {
-    return staleAge;
-}
+/**
+ * The number of seconds in a year.
+ */
+const ONE_YEAR = 60 * 60 * 24 * 365;
 
+/**
+ * Determines the fallback strategy based on the provided routeFallback value.
+ *
+ * @param routeFallback - The fallback value for the dynamic route.
+ * @returns The fallback strategy. See {@link FallbackStrategy}.
+ */
 function determineFallback(routeFallback?: PrerenderManifest['dynamicRoutes'][string]['fallback']): FallbackStrategy {
-    switch (typeof routeFallback) {
-        // false is fallback: false
-        case 'boolean': {
-            return 'false';
-        }
-        // string is fallback: true
-        case 'string': {
-            return 'true';
-        }
-        // null is fallback: blocking
-        case 'object': {
+    switch (true) {
+        case routeFallback === null:
             return 'blocking';
-        }
-        // anything else is fallback: unknown
-        case 'undefined': {
-            return 'unknown';
-        }
+
+        case routeFallback === false:
+            return 'false';
+
+        case typeof routeFallback === 'string':
+            return 'true';
+
         default:
             return 'unknown';
     }
 }
-
-const ONE_YEAR_IN_SECONDS = 60 * 60 * 24 * 365;
 
 /**
  * A set of time periods and timestamps for controlling cache behavior.
@@ -87,6 +93,10 @@ type LifespanParameters = {
      * Time in seconds before the cache entry becomes expired.
      */
     expireAge: number;
+    /**
+     * Value from Next.js revalidate option. May be false if the page has no revalidate option or the revalidate option is set to false.
+     */
+    revalidate: Revalidate | undefined;
 };
 
 /**
@@ -201,6 +211,24 @@ type NamedCache = Cache & {
 };
 
 /**
+ * Represents the parameters for Time-to-Live (TTL) configuration.
+ */
+type TTLParameters = {
+    /**
+     * The time period in seconds for when the cache entry becomes stale. Defaults to 1 year.
+     */
+    defaultStaleAge: number;
+    /**
+     * Estimates the expiration age based on the stale age.
+     *
+     * @param staleAge - The stale age in seconds.
+     *
+     * @returns The expiration age in seconds.
+     */
+    estimateExpireAge(staleAge: number): number;
+};
+
+/**
  * Configuration options for the cache handler.
  */
 export type CacheConfig = {
@@ -210,13 +238,9 @@ export type CacheConfig = {
      */
     cache: Cache | (Cache | undefined | null)[];
     /**
-     * A function that calculates the expiration age of stale cache entries.
-     *
-     * @param staleAge - The age of the stale cache entry.
-     *
-     * @returns The expiration age of the cache entry.
+     * Time-to-live (TTL) options for the cache entries.
      */
-    determineExpireAge?(staleAge: number): number;
+    ttl?: Partial<TTLParameters>;
 };
 
 /**
@@ -314,9 +338,9 @@ export class IncrementalCache implements CacheHandler {
      * ```js
      * // cache-handler.mjs
      * IncrementalCache.onCreation(async () => {
-     *  const = redisCache = await createRedisCache({
+     *   const redisCache = await createRedisCache({
      *    client,
-     *  });
+     *   });
      *
      *   const localCache = createLruCache();
      *
@@ -327,7 +351,7 @@ export class IncrementalCache implements CacheHandler {
      *
      * // after the Next.js called the onCreation hook
      * console.log(IncrementalCache.name);
-     * // Output: "@neshca/cache-handler with 2 Handlers and file system caching"
+     * // Output: "@neshca/cache-handler with 2 Handlers"
      * ```
      */
     public static get name(): string {
@@ -369,13 +393,15 @@ export class IncrementalCache implements CacheHandler {
 
     static #debug = typeof process.env.NEXT_PRIVATE_DEBUG_CACHE !== 'undefined';
 
+    static #defaultStaleAge: number;
+
+    static #estimateExpireAge: (staleAge: number) => number;
+
     static #routeInitialRevalidateSeconds: Map<string, Revalidate> = new Map();
 
     static #routeRuntimeRevalidateSeconds: Map<string, Revalidate> = new Map();
 
     static #routeFallbackStrategy: Map<string, FallbackStrategy> = new Map();
-
-    static #determineExpireAge: NonNullable<CacheConfig['determineExpireAge']>;
 
     static #onCreationHook: OnCreationHook;
 
@@ -397,7 +423,7 @@ export class IncrementalCache implements CacheHandler {
      *
      * @param revalidate The revalidate option, representing the maximum age of stale data in seconds.
      *
-     * @returns The cache control parameters including expire age, expire at, last modified at, stale age, and stale at.
+     * @returns The cache control parameters including expire age, expire at, last modified at, stale age, stale at and revalidate.
      *
      * @remarks
      * - `lastModifiedAt` is the Unix timestamp (in seconds) for when the cache entry was last modified.
@@ -406,15 +432,17 @@ export class IncrementalCache implements CacheHandler {
      * - `expireAge` is the time period in seconds for when the cache entry becomes expired.
      * - `staleAt` is the Unix timestamp (in seconds) for when the cache entry becomes stale.
      * - `expireAt` is the Unix timestamp (in seconds) for when the cache entry must be removed from the cache.
+     * - `revalidate` is the value from Next.js revalidate option.
+     * May be false if the page has no revalidate option or the revalidate option is set to false.
      */
-    static #lheLifespanParameters(lastModified: number, revalidate?: Revalidate): LifespanParameters {
+    static #getLifespanParameters(lastModified: number, revalidate?: Revalidate): LifespanParameters {
         const lastModifiedAt = Math.floor(lastModified / 1000);
-        const staleAge = revalidate || ONE_YEAR_IN_SECONDS;
+        const staleAge = revalidate || IncrementalCache.#defaultStaleAge;
         const staleAt = lastModifiedAt + staleAge;
-        const expireAge = IncrementalCache.#determineExpireAge?.(staleAge) ?? staleAge;
-        const expireAt = Math.floor(lastModifiedAt + expireAge);
+        const expireAge = IncrementalCache.#estimateExpireAge(staleAge);
+        const expireAt = lastModifiedAt + expireAge;
 
-        return { expireAge, expireAt, lastModifiedAt, staleAge, staleAt };
+        return { expireAge, expireAt, lastModifiedAt, revalidate, staleAge, staleAt };
     }
 
     /**
@@ -439,7 +467,13 @@ export class IncrementalCache implements CacheHandler {
         const config = IncrementalCache.#onCreationHook(cacheCreationContext);
 
         // Wait for the cache configuration to be resolved
-        const { cache, determineExpireAge = defaultDetermineExpireAge } = await config;
+        const { cache, ttl = {} } = await config;
+
+        const { defaultStaleAge, estimateExpireAge } = ttl;
+
+        IncrementalCache.#defaultStaleAge = typeof defaultStaleAge === 'number' ? defaultStaleAge : ONE_YEAR;
+
+        IncrementalCache.#estimateExpireAge = createValidatedAgeEstimationFunction(estimateExpireAge);
 
         // Extract the server distribution directory from the cache creation context
         const { serverDistDir, dev } = cacheCreationContext;
@@ -451,17 +485,6 @@ export class IncrementalCache implements CacheHandler {
 
         // Check if the pages directory exists and set the flag accordingly
         IncrementalCache.#hasPagesDir = fs.existsSync(path.join(serverDistDir, 'pages'));
-
-        // Set the class-level function to calculate the expiration age of stale cache entries
-        IncrementalCache.#determineExpireAge = (staleAge) => {
-            const expireAge = Math.floor(determineExpireAge(staleAge));
-
-            if (!Number.isInteger(expireAge) || expireAge <= 0 || expireAge > MAX_INT32) {
-                throw new Error(`The expire age must be a positive integer and less than ${MAX_INT32}.`);
-            }
-
-            return expireAge;
-        };
 
         // Define the path for the tags manifest file
         IncrementalCache.#tagsManifestPath = path.join(
@@ -482,15 +505,10 @@ export class IncrementalCache implements CacheHandler {
             // Parse the tags manifest data
             const tagsManifestFromFileSystem = JSON.parse(tagsManifestData) as unknown;
 
-            // Update the local RevalidatedTags if the parsed data is a valid tags manifest
             if (isTagsManifest(tagsManifestFromFileSystem)) {
-                IncrementalCache.#revalidatedTags = Object.entries(
-                    tagsManifestFromFileSystem.items,
-                ).reduce<RevalidatedTags>((revalidatedTags, [tag, { revalidatedAt }]) => {
-                    revalidatedTags[tag] = revalidatedAt;
-
-                    return revalidatedTags;
-                }, {});
+                for (const [tag, { revalidatedAt }] of Object.entries(tagsManifestFromFileSystem.items)) {
+                    IncrementalCache.#revalidatedTags[tag] = revalidatedAt;
+                }
             }
         } catch (_error) {
             // If the file doesn't exist, use the default tagsManifest
@@ -640,9 +658,9 @@ export class IncrementalCache implements CacheHandler {
 
     async #readCacheFromFileSystem(
         cacheKey: string,
+        expireAge: number,
         kindHint?: IncrementalCacheKindHint,
         tags?: string[],
-        expireAge = ONE_YEAR_IN_SECONDS,
     ): Promise<CacheHandlerValue | null> {
         try {
             const bodyFilePath = this.#getFilePath(`${cacheKey}.body`, 'app');
@@ -691,9 +709,9 @@ export class IncrementalCache implements CacheHandler {
 
             const fallback = IncrementalCache.#routeFallbackStrategy.get(cacheKey);
 
-            const shouldServe = fallback === 'false';
+            const pageHasFallbackFalse = fallback === 'false';
 
-            if (!shouldServe && ageSeconds > expireAge) {
+            if (!pageHasFallbackFalse && ageSeconds > expireAge) {
                 return null;
             }
 
@@ -822,11 +840,11 @@ export class IncrementalCache implements CacheHandler {
 
         const { tags = [], softTags = [], kindHint, revalidate } = ctx;
 
+        // there is no revalidate option for the values from the Pages Router, so we need to infer it from the initial value or the runtime value
         const inferredRevalidate = revalidate ?? IncrementalCache.#getRouteRevalidateSeconds(cacheKey);
 
-        const staleAge = inferredRevalidate || ONE_YEAR_IN_SECONDS;
-
-        const expireAge = IncrementalCache.#determineExpireAge?.(staleAge) ?? staleAge;
+        // if inferredRevalidate is false, we set the expireAge to 1 year
+        const expireAge = IncrementalCache.#estimateExpireAge(inferredRevalidate || IncrementalCache.#defaultStaleAge);
 
         let cachedData: CacheHandlerValue | null | undefined = await IncrementalCache.#cache.get(
             cacheKey,
@@ -834,7 +852,7 @@ export class IncrementalCache implements CacheHandler {
         );
 
         if (!cachedData) {
-            cachedData = await this.#readCacheFromFileSystem(cacheKey, kindHint, tags, expireAge);
+            cachedData = await this.#readCacheFromFileSystem(cacheKey, expireAge, kindHint, tags);
 
             if (IncrementalCache.#debug) {
                 console.info('get from file system', cacheKey, tags, kindHint, 'got any value', Boolean(cachedData));
@@ -844,7 +862,7 @@ export class IncrementalCache implements CacheHandler {
                 await IncrementalCache.#cache.set(
                     cacheKey,
                     cachedData,
-                    IncrementalCache.#lheLifespanParameters(cachedData.lastModified, staleAge),
+                    IncrementalCache.#getLifespanParameters(cachedData.lastModified, inferredRevalidate),
                 );
             }
         }
@@ -934,7 +952,7 @@ export class IncrementalCache implements CacheHandler {
 
         const lastModified = Date.now();
 
-        const staleAge = revalidate ?? IncrementalCache.#routeInitialRevalidateSeconds.get(cacheKey);
+        const inferredRevalidate = revalidate ?? IncrementalCache.#routeInitialRevalidateSeconds.get(cacheKey);
 
         await IncrementalCache.#cache.set(
             cacheKey,
@@ -942,7 +960,7 @@ export class IncrementalCache implements CacheHandler {
                 value: data,
                 lastModified,
             },
-            IncrementalCache.#lheLifespanParameters(Date.now(), staleAge),
+            IncrementalCache.#getLifespanParameters(lastModified, inferredRevalidate),
         );
 
         typeof revalidate !== 'undefined' && IncrementalCache.#routeRuntimeRevalidateSeconds.set(cacheKey, revalidate);
@@ -982,21 +1000,19 @@ export class IncrementalCache implements CacheHandler {
         }
 
         try {
-            const tagsManifest = Object.entries(IncrementalCache.#revalidatedTags).reduce<TagsManifest>(
-                (acc, [revalidatedTag, revalidatedAt]) => {
-                    acc.items[revalidatedTag] = {
-                        revalidatedAt,
-                    };
+            const tagsManifest: TagsManifest = {
+                version: 1,
+                items: {},
+            };
 
-                    return acc;
-                },
-                {
-                    version: 1,
-                    items: {},
-                },
-            );
+            for (const [revalidatedTag, revalidatedAt] of Object.entries(IncrementalCache.#revalidatedTags)) {
+                tagsManifest.items[revalidatedTag] = {
+                    revalidatedAt,
+                };
+            }
 
             await fsPromises.writeFile(IncrementalCache.#tagsManifestPath, JSON.stringify(tagsManifest));
+
             if (IncrementalCache.#debug) {
                 console.info('updated tags manifest file');
             }
@@ -1009,7 +1025,7 @@ export class IncrementalCache implements CacheHandler {
     #detectFileKind(pathname: string): 'app' | 'pages' {
         const pagesDir = this.#pagesDir ?? IncrementalCache.#hasPagesDir;
 
-        if (!this.#appDir && !pagesDir) {
+        if (!(this.#appDir || pagesDir)) {
             throw new Error("Invariant: Can't determine file path kind, no page directory enabled");
         }
 

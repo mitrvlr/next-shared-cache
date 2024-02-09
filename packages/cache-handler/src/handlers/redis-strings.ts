@@ -62,7 +62,7 @@ export default function createCache<T extends RedisClientType>({
             // use reviveFromBase64Representation to restore binary data from Base64
             return JSON.parse(result, reviveFromBase64Representation) as CacheHandlerValue | null;
         },
-        async set(key, value, cacheOptions) {
+        async set(key, value, { expireAt }) {
             assertClientIsReady();
 
             const options = getTimeoutRedisCommandOptions(timeoutMs);
@@ -70,13 +70,9 @@ export default function createCache<T extends RedisClientType>({
             // use replaceJsonWithBase64 to store binary data in Base64 and save space
             const setOperation = client.set(options, keyPrefix + key, JSON.stringify(value, replaceJsonWithBase64));
 
-            const operations: Promise<unknown>[] = [setOperation];
+            const expireOperation = client.expireAt(options, keyPrefix + key, expireAt);
 
-            if (cacheOptions.expireAt) {
-                operations.push(client.expireAt(options, keyPrefix + key, cacheOptions.expireAt));
-            }
-
-            await Promise.allSettled(operations);
+            await Promise.all([setOperation, expireOperation]);
         },
         async getRevalidatedTags() {
             assertClientIsReady();
@@ -86,13 +82,11 @@ export default function createCache<T extends RedisClientType>({
                 keyPrefix + revalidatedTagsKey,
             );
 
-            const entries = Object.entries(sharedRevalidatedTags);
+            const revalidatedTags: RevalidatedTags = {};
 
-            const revalidatedTags = entries.reduce<RevalidatedTags>((acc, [tag, revalidatedAt]) => {
-                acc[tag] = Number(revalidatedAt);
-
-                return acc;
-            }, {});
+            for (const [tag, revalidatedAt] of Object.entries(sharedRevalidatedTags)) {
+                revalidatedTags[tag] = Number(revalidatedAt);
+            }
 
             return revalidatedTags;
         },
